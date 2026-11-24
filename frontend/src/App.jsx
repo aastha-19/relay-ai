@@ -144,7 +144,7 @@ export default function App() {
       {/* Top Header */}
       <header className="chat-header">
         <div className="header-left">
-          <div className="logo-badge">⚡ Lyftr AI</div>
+          <div className="logo-badge">RelayAI</div>
           <div className="session-tag">
             Session: <code>{sessionId}</code>
           </div>
