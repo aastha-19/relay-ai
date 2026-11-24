@@ -42,6 +42,9 @@ async def lifespan(app: FastAPI):
     # Initialize SQLite database on startup
     init_db()
     logger.info("Database initialized successfully.")
+    pool = get_key_pool()
+    from app.config import LLM_MODEL
+    logger.info(f"LLM Gateway ready with model={LLM_MODEL}, {len(pool)} keys loaded: {[k[0] for k in pool]}")
     yield
 
 

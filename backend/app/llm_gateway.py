@@ -121,7 +121,7 @@ def execute_llm_call(
     key_pool = get_key_pool()
     fallback_attempts = 0
 
-    for key_id, api_key in key_pool:
+    for idx, (key_id, api_key) in enumerate(key_pool):
         # Check simulated failure for this key
         should_fail = False
         fail_status = 500
@@ -137,57 +137,73 @@ def execute_llm_call(
             fallback_attempts += 1
             continue
 
-        try:
-            # Call LiteLLM completion
-            response = litellm.completion(
-                model=LLM_MODEL,
-                messages=messages_payload,
-                api_key=api_key,
-                timeout=30
-            )
+        # If this is the last available key and it encounters a transient 503/high demand from Google,
+        # allow one quick retry after backoff to prevent intermittent provider outages from failing the request
+        is_last_key = (idx == len(key_pool) - 1)
+        max_attempts = 2 if is_last_key else 1
 
-            reply_text = ""
-            if response and response.choices and len(response.choices) > 0:
-                reply_text = response.choices[0].message.content or ""
+        response = None
+        for attempt in range(max_attempts):
+            try:
+                logger.info(f"Attempting provider call with {key_id} (attempt {attempt+1}/{max_attempts}, model={LLM_MODEL})")
+                response = litellm.completion(
+                    model=LLM_MODEL,
+                    messages=messages_payload,
+                    api_key=api_key,
+                    timeout=30
+                )
+                break
+            except Exception as e:
+                # Sanitize error to avoid logging raw secret keys
+                err_msg = str(e)
+                for _, k_val in key_pool:
+                    if len(k_val) > 6 and k_val in err_msg:
+                        err_msg = err_msg.replace(k_val, "[REDACTED_KEY]")
+                logger.warning(f"Provider call failed for {key_id} (attempt {attempt+1}/{max_attempts}): {type(e).__name__} - {err_msg[:250]}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1.0)
 
-            # Token usage extraction
-            usage = getattr(response, "usage", None)
-            input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
-            output_tokens = getattr(usage, "completion_tokens", None) if usage else None
-
-            if input_tokens is None or input_tokens <= 0:
-                input_tokens = count_tokens(LLM_MODEL, messages=messages_payload)
-            if output_tokens is None or output_tokens <= 0:
-                output_tokens = count_tokens(LLM_MODEL, text=reply_text)
-
-            latency_ms = max(1, int((time.perf_counter() - start_time) * 1000))
-
-            # Populate cache if this was not a simulated run
-            if not simulated_failures:
-                llm_cache.set(cache_key, {
-                    "reply": reply_text,
-                    "model": LLM_MODEL,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens
-                })
-
-            return {
-                "reply": reply_text,
-                "metadata": {
-                    "resolution_source": "LIVE_INFERENCE",
-                    "model": LLM_MODEL,
-                    "latency_ms": latency_ms,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "key_id": key_id,
-                    "fallback_attempts": fallback_attempts
-                }
-            }
-
-        except Exception as e:
-            logger.warning(f"Provider call failed for {key_id}: {str(e)}")
+        if response is None:
             fallback_attempts += 1
             continue
+
+        reply_text = ""
+        if response and response.choices and len(response.choices) > 0:
+            reply_text = response.choices[0].message.content or ""
+
+        # Token usage extraction
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+
+        if input_tokens is None or input_tokens <= 0:
+            input_tokens = count_tokens(LLM_MODEL, messages=messages_payload)
+        if output_tokens is None or output_tokens <= 0:
+            output_tokens = count_tokens(LLM_MODEL, text=reply_text)
+
+        latency_ms = max(1, int((time.perf_counter() - start_time) * 1000))
+
+        # Populate cache if this was not a simulated run
+        if not simulated_failures:
+            llm_cache.set(cache_key, {
+                "reply": reply_text,
+                "model": LLM_MODEL,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens
+            })
+
+        return {
+            "reply": reply_text,
+            "metadata": {
+                "resolution_source": "LIVE_INFERENCE",
+                "model": LLM_MODEL,
+                "latency_ms": latency_ms,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "key_id": key_id,
+                "fallback_attempts": fallback_attempts
+            }
+        }
 
     # Every key failed
     logger.error("All providers unavailable in key pool")
